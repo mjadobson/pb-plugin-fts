@@ -1,30 +1,53 @@
 package fts
 
 import (
-	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 
 	validation "github.com/go-ozzo/ozzo-validation/v4"
+	_ "github.com/mjadobson/pb-plugin-fts/migrations"
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/search"
-	_ "github.com/pocketbuilds/fts/migrations"
+	"github.com/pocketbase/pocketbase/tools/types"
 	"github.com/pocketbuilds/xpb"
 )
 
+const pluginsCollectionName = "_plugins"
+const pluginNameField = "plugin_name"
+const configField = "config"
+const enabledField = "enabled"
+const defaultTokenizer = "porter"
+
+// FTSConfig represents a single FTS configuration for a collection
+type FTSConfig struct {
+	CollectionName string   `json:"collection_name"`
+	Fields         []string `json:"fields"`
+	Tokenizer      string   `json:"tokenizer"`
+}
+
 func init() {
-	xpb.Register(&Plugin{
-		DefaultTokenizer: "porter",
-	})
+	xpb.Register(&Plugin{})
 }
 
 type Plugin struct {
-	DefaultTokenizer string `json:"default_tokenizer"`
+	state *pluginState
+}
+
+type pluginState struct {
+	mu     sync.RWMutex
+	config map[string][]FTSConfig // collection -> configs
+}
+
+func newPluginState() *pluginState {
+	return &pluginState{
+		config: make(map[string][]FTSConfig),
+	}
 }
 
 func (p *Plugin) Name() string {
@@ -42,153 +65,61 @@ func (p *Plugin) Description() string {
 }
 
 func (p *Plugin) Init(app core.App) error {
+	p.state = newPluginState()
+
+	if app.IsBootstrapped() {
+		if err := p.initialize(app); err != nil {
+			return err
+		}
+	} else {
+		app.OnBootstrap().BindFunc(func(e *core.BootstrapEvent) error {
+			if err := e.Next(); err != nil {
+				return err
+			}
+			return p.initialize(e.App)
+		})
+	}
+
 	app.OnServe().BindFunc(p.setupFtsRoute)
-	app.OnRecordValidate("_fts").BindFunc(p.validateFtsFieldsField)
-	app.OnRecordValidate("_fts").BindFunc(p.validateFtsTokenizerField)
-	app.OnRecordCreate("_fts").BindFunc(p.createFtsTableOnRecordEvent)
-	app.OnRecordUpdate("_fts").BindFunc(p.createFtsTableOnRecordEvent)
-	app.OnRecordDelete("_fts").BindFunc(p.dropFtsTableOnRecordDelete)
-	app.OnCollectionCreate().BindFunc(p.updateFtsCollectionOnCollectionEvent())
-	app.OnCollectionUpdate().BindFunc(p.updateFtsCollectionOnCollectionEvent())
-	app.OnCollectionDelete().BindFunc(p.updateFtsCollectionOnCollectionEvent())
-	app.OnCollectionUpdate().BindFunc(p.updateFtsRecordOnCollectionUpdate())
-	app.OnCollectionDelete().BindFunc(p.deleteFtsRecordOnCollectionDelete())
-	return nil
-}
 
-func (p *Plugin) updateFtsCollectionOnCollectionEvent() func(e *core.CollectionEvent) error {
-	return func(e *core.CollectionEvent) error {
-		if e.Collection.Name == "_fts" {
-			return e.Next()
-		}
-		if err := e.Next(); err != nil {
-			return err
-		}
-		ftsCollection, err := e.App.FindCollectionByNameOrId("_fts")
-		if err != nil {
-			e.App.Logger().Error("failed to find _fts collection", "error", err)
-			return nil
-		}
-		field, ok := ftsCollection.Fields.GetByName("collection").(*core.SelectField)
-		if field == nil || !ok {
-			e.App.Logger().Error("failed to get collection field from _fts", "error", err)
-			return nil
-		}
-		collectionsNameQuery := e.App.DB().Select("name").From("_collections").
-			Where(dbx.HashExp{
-				"system": false,
-			}).
-			AndWhere(dbx.Not(dbx.HashExp{
-				"name": "_fts",
-			})).
-			OrderBy("name")
-		field.Values = []string{}
-		if err := collectionsNameQuery.Column(&field.Values); err != nil {
-			e.App.Logger().Error("failed to query collection names", "error", err)
-			return nil
-		}
-		if err := e.App.Save(ftsCollection); err != nil {
-			e.App.Logger().Error("failed to update _fts collection", "error", err)
-			return nil
-		}
-		return nil
-	}
-}
+	// Validate FTS configs when they change
+	app.OnRecordValidate(pluginsCollectionName).BindFunc(p.validatePluginsConfigField)
 
-func (p *Plugin) updateFtsRecordOnCollectionUpdate() func(e *core.CollectionEvent) error {
-	return func(e *core.CollectionEvent) error {
-		if e.Collection.Name == "_fts" {
-			return e.Next()
-		}
-		ftsRecord, err := e.App.FindFirstRecordByData("_fts", "collection", e.Collection.Name)
-		if err != nil {
-			if !errors.Is(err, sql.ErrNoRows) {
-				return err
+	// Reload state when FTS configs change
+	refreshConfigs := func(e *core.RecordEvent) error {
+		if e.Record.GetString(pluginNameField) == p.Name() {
+			if err := p.refreshState(e.App); err != nil {
+				e.App.Logger().Error("fts config reload failed", "error", err)
 			}
-			return e.Next()
-		}
-		if err := p.dropFtsTable(e.App, ftsRecord); err != nil {
-			return err
-		}
-		if err := e.Next(); err != nil {
-			return err
-		}
-		var (
-			fields    []string
-			newFields []string
-		)
-		if err := ftsRecord.UnmarshalJSONField("fields", &fields); err != nil {
-			return err
-		}
-		validFieldNames := e.Collection.Fields.FieldNames()
-		for _, f := range fields {
-			if slices.Contains(validFieldNames, f) {
-				newFields = append(newFields, f)
-			}
-		}
-		ftsRecord.Set("fields", newFields)
-		if err := e.App.Save(ftsRecord); err != nil {
-			return err
-		}
-		return nil
-	}
-}
-
-func (p *Plugin) deleteFtsRecordOnCollectionDelete() func(e *core.CollectionEvent) error {
-	return func(e *core.CollectionEvent) error {
-		if e.Collection.Name == "_fts" {
-			return e.Next()
-		}
-		ftsRecord, err := e.App.FindFirstRecordByData("_fts", "collection", e.Collection.Name)
-		if err != nil {
-			if !errors.Is(err, sql.ErrNoRows) {
-				return err
-			}
-			return e.Next()
-		}
-		if err := e.App.Delete(ftsRecord); err != nil {
-			return err
 		}
 		return e.Next()
 	}
+
+	app.OnRecordAfterCreateSuccess(pluginsCollectionName).BindFunc(refreshConfigs)
+	app.OnRecordAfterUpdateSuccess(pluginsCollectionName).BindFunc(refreshConfigs)
+	app.OnRecordAfterDeleteSuccess(pluginsCollectionName).BindFunc(refreshConfigs)
+
+	// Handle collection changes that might affect FTS configs
+	refreshOnCollectionChange := func(e *core.CollectionEvent) error {
+		if err := p.refreshState(e.App); err != nil {
+			e.App.Logger().Error("fts config reload failed", "error", err)
+		}
+		return e.Next()
+	}
+
+	app.OnCollectionAfterCreateSuccess().BindFunc(refreshOnCollectionChange)
+	app.OnCollectionAfterUpdateSuccess().BindFunc(refreshOnCollectionChange)
+	app.OnCollectionAfterDeleteSuccess().BindFunc(refreshOnCollectionChange)
+
+	return nil
 }
 
-func (p *Plugin) createFtsTableOnRecordEvent(e *core.RecordEvent) error {
-	originalApp := e.App
-	txErr := e.App.RunInTransaction(func(txApp core.App) error {
-		e.App = txApp
+func (p *Plugin) initialize(app core.App) error {
+	if err := ensurePluginsCollection(app); err != nil {
+		return err
+	}
 
-		if err := e.Next(); err != nil {
-			return err
-		}
-
-		if err := p.createFtsTable(e.App, e.Record); err != nil {
-			return err
-		}
-
-		return nil
-	})
-	e.App = originalApp
-	return txErr
-}
-
-func (p *Plugin) dropFtsTableOnRecordDelete(e *core.RecordEvent) error {
-	originalApp := e.App
-	txErr := e.App.RunInTransaction(func(txApp core.App) error {
-		e.App = txApp
-
-		if err := e.Next(); err != nil {
-			return err
-		}
-
-		if err := p.dropFtsTable(e.App, e.Record); err != nil {
-			return err
-		}
-
-		return nil
-	})
-	e.App = originalApp
-	return txErr
+	return p.refreshState(app)
 }
 
 func (p *Plugin) setupFtsRoute(e *core.ServeEvent) error {
@@ -205,6 +136,12 @@ func (p *Plugin) setupFtsRoute(e *core.ServeEvent) error {
 
 		if collection.ListRule == nil && !requestInfo.HasSuperuserAuth() {
 			return e.ForbiddenError("Only superusers can perform this action.", nil)
+		}
+
+		// Check if collection has FTS configured
+		configs := p.getConfigsForCollection(collection.Name)
+		if len(configs) == 0 {
+			return e.NotFoundError("Full text search not configured for this collection.", nil)
 		}
 
 		fieldsResolver := core.NewRecordFieldResolver(
@@ -258,17 +195,139 @@ func (p *Plugin) setupFtsRoute(e *core.ServeEvent) error {
 	return e.Next()
 }
 
-func (p *Plugin) createFtsTable(app core.App, record *core.Record) error {
-	collectionName := record.GetString("collection")
-
-	ftsTableName := p.ftsTableNameFromCollectionName(collectionName)
-
-	var fieldNames []string
-	if err := record.UnmarshalJSONField("fields", &fieldNames); err != nil {
-		return err
+func (p *Plugin) refreshState(app core.App) error {
+	records, err := app.FindAllRecords(pluginsCollectionName, dbx.HashExp{
+		pluginNameField: p.Name(),
+		enabledField:    true,
+	})
+	if err != nil {
+		return fmt.Errorf("load FTS configs: %w", err)
 	}
 
-	ftsFieldNames := p.ftsFieldNameSlice(fieldNames)
+	next := make(map[string][]FTSConfig)
+
+	for _, record := range records {
+		configs, err := parsePluginConfigs(record)
+		if err != nil {
+			app.Logger().Error("fts invalid config", "recordId", record.Id, "error", err)
+			continue
+		}
+
+		seenCollections := make(map[string]int, len(configs))
+		for i, cfg := range configs {
+			if err := validateConfigShape(cfg); err != nil {
+				app.Logger().Error("fts invalid config shape", "recordId", record.Id, "configIndex", i, "error", err)
+				continue
+			}
+
+			collection, err := app.FindCollectionByNameOrId(cfg.CollectionName)
+			if err != nil {
+				app.Logger().Warn("fts collection not found", "recordId", record.Id, "collection", cfg.CollectionName, "error", err)
+				if _, exists := seenCollections[cfg.CollectionName]; exists {
+					app.Logger().Warn("fts duplicate config skipped", "recordId", record.Id, "configIndex", i, "collection", cfg.CollectionName)
+					continue
+				}
+				seenCollections[cfg.CollectionName] = i
+				next[cfg.CollectionName] = append(next[cfg.CollectionName], cfg)
+				continue
+			}
+
+			cfg = p.normalizeConfig(cfg, collection)
+
+			if err := p.validateConfigForCollection(cfg, collection); err != nil {
+				app.Logger().Error("fts invalid collection config", "recordId", record.Id, "configIndex", i, "collection", cfg.CollectionName, "error", err)
+				continue
+			}
+
+			if _, exists := seenCollections[cfg.CollectionName]; exists {
+				app.Logger().Warn("fts duplicate config skipped", "recordId", record.Id, "configIndex", i, "collection", cfg.CollectionName)
+				continue
+			}
+			seenCollections[cfg.CollectionName] = i
+
+			// Ensure FTS table exists
+			if err := p.createFtsTable(app, cfg); err != nil {
+				app.Logger().Error("fts table creation failed", "recordId", record.Id, "configIndex", i, "collection", cfg.CollectionName, "error", err)
+				continue
+			}
+
+			next[cfg.CollectionName] = append(next[cfg.CollectionName], cfg)
+		}
+	}
+
+	p.state.mu.Lock()
+	p.state.config = next
+	p.state.mu.Unlock()
+
+	return nil
+}
+
+func validateConfigShape(cfg FTSConfig) error {
+	if cfg.CollectionName == "" {
+		return errors.New("collection_name is required")
+	}
+	return nil
+}
+
+func (p *Plugin) normalizeConfig(cfg FTSConfig, collection *core.Collection) FTSConfig {
+	if len(cfg.Fields) == 0 {
+		for key := range core.NewRecord(collection).PublicExport() {
+			if key != core.FieldNameCollectionId && key != core.FieldNameCollectionName {
+				cfg.Fields = append(cfg.Fields, key)
+			}
+		}
+	}
+
+	if !slices.Contains(cfg.Fields, "id") {
+		cfg.Fields = append([]string{"id"}, cfg.Fields...)
+	}
+
+	if cfg.Tokenizer == "" {
+		cfg.Tokenizer = defaultTokenizer
+	}
+
+	return cfg
+}
+
+func (p *Plugin) validateConfigForCollection(cfg FTSConfig, collection *core.Collection) error {
+	for _, fieldName := range cfg.Fields {
+		field := collection.Fields.GetByName(fieldName)
+		if field == nil {
+			return fmt.Errorf("field %q not found in collection %q", fieldName, cfg.CollectionName)
+		}
+	}
+
+	// Prevent indexing password and token fields in auth collections
+	if collection.IsAuth() {
+		for _, fieldName := range cfg.Fields {
+			if fieldName == core.FieldNamePassword || fieldName == core.FieldNameTokenKey {
+				return fmt.Errorf("field %q cannot be indexed in auth collection %q", fieldName, cfg.CollectionName)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (p *Plugin) getConfigsForCollection(collectionName string) []FTSConfig {
+	p.state.mu.RLock()
+	defer p.state.mu.RUnlock()
+
+	configs := p.state.config[collectionName]
+	if len(configs) == 0 {
+		return nil
+	}
+
+	// Return a copy to prevent external modification
+	cloned := make([]FTSConfig, len(configs))
+	copy(cloned, configs)
+	return cloned
+}
+
+func (p *Plugin) createFtsTable(app core.App, config FTSConfig) error {
+	ftsTableName := p.ftsTableNameFromCollectionName(config.CollectionName)
+
+	ftsFieldNames := p.ftsFieldNameSlice(config.Fields)
 
 	var query *dbx.Query
 
@@ -284,12 +343,12 @@ func (p *Plugin) createFtsTable(app core.App, record *core.Record) error {
 		`CREATE VIRTUAL TABLE %s USING fts5 (%s, tokenize="%s");`,
 		ftsTableName,
 		strings.Join(ftsFieldNames, ", "),
-		record.GetString("tokenizer"),
+		config.Tokenizer,
 	))
 	if _, err := query.Execute(); err != nil {
 		if strings.Contains(err.Error(), "no such tokenizer") {
 			return validation.Errors{
-				"tokenizer": validation.NewError("invalid_tokenizer", "no such tokenizer"),
+				"config": validation.NewError("invalid_tokenizer", "no such tokenizer"),
 			}
 		}
 		return err
@@ -299,8 +358,8 @@ func (p *Plugin) createFtsTable(app core.App, record *core.Record) error {
 		`INSERT INTO %s (%s) SELECT %s FROM %s;`,
 		ftsTableName,
 		strings.Join(ftsFieldNames, ", "),
-		strings.Join(fieldNames, ", "),
-		collectionName,
+		strings.Join(config.Fields, ", "),
+		config.CollectionName,
 	))
 	if _, err := query.Execute(); err != nil {
 		return err
@@ -317,13 +376,13 @@ func (p *Plugin) createFtsTable(app core.App, record *core.Record) error {
 	query = app.DB().NewQuery(fmt.Sprintf(
 		`CREATE TRIGGER IF NOT EXISTS insert_%s AFTER INSERT ON %s BEGIN %s END;`,
 		ftsTableName,
-		collectionName,
+		config.CollectionName,
 		fmt.Sprintf(
 			`INSERT INTO %s (%s) SELECT %s FROM %s WHERE id = NEW.id;`,
 			ftsTableName,
 			strings.Join(ftsFieldNames, ", "),
-			strings.Join(fieldNames, ", "),
-			collectionName,
+			strings.Join(config.Fields, ", "),
+			config.CollectionName,
 		),
 	))
 	if _, err := query.Execute(); err != nil {
@@ -341,14 +400,14 @@ func (p *Plugin) createFtsTable(app core.App, record *core.Record) error {
 	query = app.DB().NewQuery(fmt.Sprintf(
 		`CREATE TRIGGER IF NOT EXISTS update_%s AFTER UPDATE ON %s BEGIN %s END;`,
 		ftsTableName,
-		collectionName,
+		config.CollectionName,
 		fmt.Sprintf(
-			`UPDATE %s SET %s;`,
+			`UPDATE %s SET %s WHERE %s = NEW.id;`,
 			ftsTableName,
 			func() string {
 				results := make([]string, 0, len(ftsFieldNames))
 				for i, ftsFieldName := range ftsFieldNames {
-					fieldName := fieldNames[i]
+					fieldName := config.Fields[i]
 					results = append(results, fmt.Sprintf(
 						"%s = NEW.%s",
 						ftsFieldName, fieldName,
@@ -356,6 +415,7 @@ func (p *Plugin) createFtsTable(app core.App, record *core.Record) error {
 				}
 				return strings.Join(results, ", ")
 			}(),
+			p.ftsFieldName("id"),
 		),
 	))
 	if _, err := query.Execute(); err != nil {
@@ -373,7 +433,7 @@ func (p *Plugin) createFtsTable(app core.App, record *core.Record) error {
 	query = app.DB().NewQuery(fmt.Sprintf(
 		`CREATE TRIGGER IF NOT EXISTS delete_%s AFTER DELETE ON %s BEGIN %s END;`,
 		ftsTableName,
-		collectionName,
+		config.CollectionName,
 		fmt.Sprintf(
 			`DELETE FROM %s WHERE %s = OLD.id;`,
 			ftsTableName,
@@ -386,8 +446,8 @@ func (p *Plugin) createFtsTable(app core.App, record *core.Record) error {
 	return nil
 }
 
-func (p *Plugin) dropFtsTable(app core.App, record *core.Record) error {
-	ftsTableName := p.ftsTableNameFromCollectionName(record.GetString("collection"))
+func (p *Plugin) dropFtsTable(app core.App, config FTSConfig) error {
+	ftsTableName := p.ftsTableNameFromCollectionName(config.CollectionName)
 	query := app.DB().NewQuery(fmt.Sprintf(
 		`DROP TABLE IF EXISTS %s;`,
 		ftsTableName,
@@ -435,7 +495,12 @@ func (p *Plugin) ftsFieldNameSlice(fieldNames []string) []string {
 	return result
 }
 
-func (p *Plugin) validateFtsFieldsField(e *core.RecordEvent) error {
+func (p *Plugin) validatePluginsConfigField(e *core.RecordEvent) error {
+	// Only validate FTS plugin configurations
+	if e.Record.GetString(pluginNameField) != p.Name() {
+		return e.Next()
+	}
+
 	err := e.Next()
 	validationErrs := validation.Errors{}
 	if e, ok := err.(validation.Errors); ok {
@@ -443,72 +508,115 @@ func (p *Plugin) validateFtsFieldsField(e *core.RecordEvent) error {
 	} else if err != nil {
 		return err
 	}
-	if _, ok := validationErrs["field"]; ok {
-		return validationErrs
-	}
-	var fields []string
-	if err := e.Record.UnmarshalJSONField("fields", &fields); err != nil {
-		validationErrs["fields"] = validation.NewError("expected_type_error", "must be an array of strings")
-		return validationErrs
-	}
-	collection, err := e.App.FindCachedCollectionByNameOrId(e.Record.GetString("collection"))
+
+	config, err := parsePluginConfigs(e.Record)
 	if err != nil {
-		return err
-	}
-	if len(fields) == 0 {
-		for k := range core.NewRecord(collection).PublicExport() {
-			if k != core.FieldNameCollectionId && k != core.FieldNameCollectionName {
-				fields = append(fields, k)
-			}
-		}
-		e.Record.Set("fields", fields)
-	}
-	if !slices.Contains(fields, "id") {
-		fields = append([]string{"id"}, fields...)
-		e.Record.Set("fields", fields)
-	}
-	missingFields := make([]string, 0, len(fields))
-	for _, f := range fields {
-		if collection.Fields.GetByName(f) == nil {
-			missingFields = append(missingFields, f)
-		}
-	}
-	if len(missingFields) > 0 {
-		validationErrs["fields"] = validation.NewError("fields_do_not_exist",
-			fmt.Sprintf(
-				"the following fields do not exist is collection %s: %s",
-				collection.Name, strings.Join(missingFields, ", "),
-			),
-		)
+		validationErrs["config"] = validation.NewError("expected_type_error", "must be an array of FTS configurations")
 		return validationErrs
 	}
-	if collection.IsAuth() {
-		illegalFields := make([]string, 0, 2)
-		if slices.Contains(fields, core.FieldNamePassword) {
-			illegalFields = append(illegalFields, core.FieldNamePassword)
+
+	seenCollections := make(map[string]int, len(config))
+
+	for i, cfg := range config {
+		idxPrefix := fmt.Sprintf("config.%d", i)
+
+		if err := validateConfigShape(cfg); err != nil {
+			validationErrs[idxPrefix] = validation.NewError("invalid_config", err.Error())
+			continue
 		}
-		if slices.Contains(fields, core.FieldNameTokenKey) {
-			illegalFields = append(illegalFields, core.FieldNameTokenKey)
+
+		// Validate collection exists
+		collection, err := e.App.FindCachedCollectionByNameOrId(cfg.CollectionName)
+		if err != nil {
+			validationErrs[idxPrefix+".collection_name"] = validation.NewError("not_found", "collection does not exist")
+			continue
 		}
-		if len(illegalFields) != 0 {
-			validationErrs["fields"] = validation.NewError("illegal_fields",
-				fmt.Sprintf(
-					"the following fields are not allowed: %s",
-					strings.Join(illegalFields, ", "),
-				),
+
+		cfg = p.normalizeConfig(cfg, collection)
+
+		if err := p.validateConfigForCollection(cfg, collection); err != nil {
+			validationErrs[idxPrefix] = validation.NewError("invalid_config", err.Error())
+			continue
+		}
+
+		if firstIndex, exists := seenCollections[cfg.CollectionName]; exists {
+			validationErrs[idxPrefix+".collection_name"] = validation.NewError(
+				"duplicate_collection",
+				fmt.Sprintf("collection already configured at config.%d", firstIndex),
 			)
-			return validationErrs
+			continue
+		}
+
+		seenCollections[cfg.CollectionName] = i
+		config[i] = cfg
+	}
+
+	// Update the config with normalized values
+	if len(validationErrs) == 0 {
+		configJSON, err := types.ParseJSONRaw(config)
+		if err != nil {
+			validationErrs["config"] = validation.NewError("encoding_error", "failed to encode configuration")
+		} else {
+			e.Record.Set("config", configJSON)
 		}
 	}
+
 	if len(validationErrs) != 0 {
 		return validationErrs
 	}
+
 	return nil
 }
 
-func (p *Plugin) validateFtsTokenizerField(e *core.RecordEvent) error {
-	if e.Record.GetString("tokenizer") == "" {
-		e.Record.Set("tokenizer", p.DefaultTokenizer)
+func ensurePluginsCollection(app core.App) error {
+	collection, err := app.FindCollectionByNameOrId(pluginsCollectionName)
+	if err != nil {
+		collection = core.NewBaseCollection(pluginsCollectionName)
 	}
-	return e.Next()
+
+	if collection.Fields.GetByName(pluginNameField) == nil {
+		collection.Fields.Add(&core.TextField{Name: pluginNameField, Required: true})
+	}
+
+	if collection.Fields.GetByName(configField) == nil {
+		collection.Fields.Add(&core.JSONField{Name: configField, Required: true})
+	}
+
+	if collection.Fields.GetByName(enabledField) == nil {
+		collection.Fields.Add(&core.BoolField{Name: enabledField})
+	}
+
+	if !hasSingleColumnUniqueIndex(collection, pluginNameField) {
+		collection.AddIndex("idx__plugins_plugin_name_unique", true, "`plugin_name`", "")
+	}
+
+	return app.Save(collection)
+}
+
+func hasSingleColumnUniqueIndex(collection *core.Collection, fieldName string) bool {
+	for _, index := range collection.Indexes {
+		if strings.Contains(index, "UNIQUE") && strings.Contains(index, "`"+fieldName+"`") {
+			return true
+		}
+	}
+
+	return false
+}
+
+func parsePluginConfigs(row *core.Record) ([]FTSConfig, error) {
+	raw, ok := row.GetRaw(configField).(types.JSONRaw)
+	if !ok {
+		return nil, errors.New("config field is not json")
+	}
+
+	var configs []FTSConfig
+	if err := raw.Scan(&configs); err != nil {
+		return nil, fmt.Errorf("decode config json: %w", err)
+	}
+
+	if len(configs) == 0 {
+		return nil, errors.New("config must include at least one entry")
+	}
+
+	return configs, nil
 }

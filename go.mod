@@ -1,4 +1,4 @@
-module github.com/pocketbuilds/fts
+module github.com/mjadobson/pb-plugin-fts
 
 go 1.24.2
 

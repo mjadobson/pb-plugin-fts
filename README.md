@@ -4,36 +4,51 @@ An [xpb](https://github.com/pocketbuilds/xpb) plugin for [Pocketbase](https://po
 
 Provides an api endpoint to do full text searches.
 
+## Fork Notes
+
+This repository was forked from [`github.com/pocketbuilds/fts`](https://github.com/pocketbuilds/fts).
+
+The main differences in this fork are:
+
+- configuration now lives in the shared `_plugins` collection instead of a dedicated `_fts` collection
+- the plugin no longer uses `pocketbuilds.toml` configuration; all runtime setup is done through `_plugins`
+- config validation normalizes defaults in `_plugins`, including automatically adding the `id` field and defaulting the tokenizer to `porter`
+- only one FTS config per collection is supported, matching the single generated FTS table per collection
+
 ## Installation
 
 1. [Install XPB](https://docs.pocketbuilds.com/installing-xpb).
 2. [Use the builder](https://docs.pocketbuilds.com/using-the-builder):
 
 ```sh
-xpb build --with github.com/pocketbuilds/fts@latest
+xpb build --with github.com/mjadobson/pb-plugin-fts@latest
 ```
 
 ## Setup
-1. Launch Pocketbase with plugin installed. You will notice it added a collection named `_fts`.
-2. Create and `_fts` record to enable full text search for the chosen collection.
-3. Optionally, choose only certain fields to be used in the vocabulary using the `_fts.fields` JSON array field of field names. If left `null` it will be populated with all collection fields. The id field is required, but will be automatically added if missing.
-4. Optionally, change the [tokenizer](https://sqlite.org/fts5.html#tokenizers) that will be used. The default tokenizer without changing the plugin config is `porter`.
-5. Use the fts api endpoint to access full text search capabilities:
+
+1. Launch PocketBase with the plugin installed. It will create a shared `_plugins` collection if needed.
+2. Add a row to `_plugins` with `plugin_name = "fts"` and `enabled = true`.
+3. Set `_plugins.config` to a JSON array of collection configs. Each config entry accepts:
+   - `collection_name`: the collection to index
+   - `fields`: optional array of field names to index; if omitted or empty, all public fields are indexed
+   - `tokenizer`: optional [fts5 tokenizer](https://sqlite.org/fts5.html#tokenizers); defaults to `porter`
+4. The `id` field is always added automatically and only one FTS config per collection is supported.
+5. Use the FTS API endpoint to access full text search capabilities:
+
 ```
 GET /api/collections/{collection}/records/fts
 ```
 
-## Plugin Config
+Example `_plugins.config` value:
 
-```toml
-# pocketbuilds.toml
-
-[fts]
-# String default tokenizer to use for full text search
-#  virtual tables. Can be changed individually in the
-#  _fts record.
-#  - default: "porter"
-default_tokenizer = "porter"
+```json
+[
+  {
+    "collection_name": "news",
+    "fields": ["title", "body"],
+    "tokenizer": "porter"
+  }
+]
 ```
 
 ## Using the FTS Api Endpoint
@@ -42,23 +57,20 @@ default_tokenizer = "porter"
 
 ```js
 // One-Off use of endpoint<script type="module">
-  const pb = new PocketBase("https://example.com")
-  const collectionName = "news";
+const pb = new PocketBase("https://example.com");
+const collectionName = "news";
 
-  const result = await pb.send(
-    `/api/collections/${collectionName}/records/fts`,
-    {
-      query: {
-        page: 1,
-        perPage: 20,
-        sort: '+created', // keep blank to use sort by fts rank
-        filter: 'status = true && created > "2022-08-01 10:00:00"',
-        // Use MATCH value
-        // https://sqlite.org/fts5.html
-        search: 'ghosts OR aliens',
-      },
-    },
-  );
+const result = await pb.send(`/api/collections/${collectionName}/records/fts`, {
+  query: {
+    page: 1,
+    perPage: 20,
+    sort: "+created", // keep blank to use sort by fts rank
+    filter: 'status = true && created > "2022-08-01 10:00:00"',
+    // Use MATCH value
+    // https://sqlite.org/fts5.html
+    search: "ghosts OR aliens",
+  },
+});
 ```
 
 ```js
@@ -83,5 +95,3 @@ default_tokenizer = "porter"
     search: 'ghosts OR aliens', // leave blank if fts is not enabled on collection
   );
 ```
-
-
