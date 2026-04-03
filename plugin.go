@@ -1,6 +1,7 @@
 package fts
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -604,13 +605,13 @@ func hasSingleColumnUniqueIndex(collection *core.Collection, fieldName string) b
 }
 
 func parsePluginConfigs(row *core.Record) ([]FTSConfig, error) {
-	raw, ok := row.GetRaw(configField).(types.JSONRaw)
-	if !ok {
-		return nil, errors.New("config field is not json")
+	raw, err := types.ParseJSONRaw(row.GetRaw(configField))
+	if err != nil {
+		return nil, fmt.Errorf("config field is not json: %w", err)
 	}
 
 	var configs []FTSConfig
-	if err := raw.Scan(&configs); err != nil {
+	if err := json.Unmarshal(raw, &configs); err != nil {
 		return nil, fmt.Errorf("decode config json: %w", err)
 	}
 
