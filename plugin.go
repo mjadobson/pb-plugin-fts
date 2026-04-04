@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -29,6 +30,7 @@ const defaultTokenizer = "porter"
 type FTSConfig struct {
 	CollectionName string   `json:"collection_name"`
 	Fields         []string `json:"fields"`
+	FieldWeights   map[string]float64 `json:"field_weights,omitempty"`
 	Tokenizer      string   `json:"tokenizer"`
 }
 
@@ -157,6 +159,8 @@ func (p *Plugin) setupFtsRoute(e *core.ServeEvent) error {
 		ftsTableName := p.ftsTableNameFromCollectionName(collection.Name)
 
 		if search := e.Request.URL.Query().Get("search"); search != "" {
+			cfg := configs[0]
+
 			query.InnerJoin(ftsTableName, dbx.NewExp(fmt.Sprintf(
 				"%s = id",
 				p.ftsFieldName("id"),
@@ -169,6 +173,11 @@ func (p *Plugin) setupFtsRoute(e *core.ServeEvent) error {
 			}))
 
 			if e.Request.URL.Query().Get("sort") == "" {
+				if rankExpr := p.ftsRankExpression(cfg); rankExpr != "" {
+					query.AndWhere(dbx.NewExp("rank MATCH {:rank}", dbx.Params{
+						"rank": rankExpr,
+					}))
+				}
 				query.OrderBy("rank")
 			}
 		}
@@ -287,6 +296,16 @@ func (p *Plugin) normalizeConfig(cfg FTSConfig, collection *core.Collection) FTS
 		cfg.Tokenizer = defaultTokenizer
 	}
 
+	if cfg.FieldWeights == nil {
+		cfg.FieldWeights = map[string]float64{}
+	}
+
+	for _, fieldName := range cfg.Fields {
+		if _, ok := cfg.FieldWeights[fieldName]; !ok {
+			cfg.FieldWeights[fieldName] = 1
+		}
+	}
+
 	return cfg
 }
 
@@ -295,6 +314,17 @@ func (p *Plugin) validateConfigForCollection(cfg FTSConfig, collection *core.Col
 		field := collection.Fields.GetByName(fieldName)
 		if field == nil {
 			return fmt.Errorf("field %q not found in collection %q", fieldName, cfg.CollectionName)
+		}
+	}
+
+	for fieldName, weight := range cfg.FieldWeights {
+		field := collection.Fields.GetByName(fieldName)
+		if field == nil {
+			return fmt.Errorf("field weight configured for unknown field %q in collection %q", fieldName, cfg.CollectionName)
+		}
+
+		if weight < 0 {
+			return fmt.Errorf("field weight for %q must be greater than or equal to 0", fieldName)
 		}
 	}
 
@@ -308,6 +338,26 @@ func (p *Plugin) validateConfigForCollection(cfg FTSConfig, collection *core.Col
 	}
 
 	return nil
+}
+
+func (p *Plugin) ftsRankExpression(cfg FTSConfig) string {
+	if len(cfg.Fields) == 0 {
+		return ""
+	}
+
+	weights := make([]string, 0, len(cfg.Fields))
+	for _, fieldName := range cfg.Fields {
+		weight := 1.0
+		if cfg.FieldWeights != nil {
+			if configuredWeight, ok := cfg.FieldWeights[fieldName]; ok {
+				weight = configuredWeight
+			}
+		}
+
+		weights = append(weights, strconv.FormatFloat(weight, 'f', -1, 64))
+	}
+
+	return fmt.Sprintf("bm25(%s)", strings.Join(weights, ", "))
 }
 
 func (p *Plugin) getConfigsForCollection(collectionName string) []FTSConfig {

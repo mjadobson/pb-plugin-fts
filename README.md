@@ -31,8 +31,9 @@ xpb build --with github.com/mjadobson/pb-plugin-fts@latest
 3. Set `_plugins.config` to a JSON array of collection configs. Each config entry accepts:
    - `collection_name`: the collection to index
    - `fields`: optional array of field names to index; if omitted or empty, all public fields are indexed
+   - `field_weights`: optional object mapping field names to ranking weights when using default FTS sort; omitted fields default to `1`
    - `tokenizer`: optional [fts5 tokenizer](https://sqlite.org/fts5.html#tokenizers); defaults to `porter`
-4. The `id` field is always added automatically and only one FTS config per collection is supported.
+4. The `id` field is always added automatically with a default weight of `1`, and only one FTS config per collection is supported.
 5. Use the FTS API endpoint to access full text search capabilities:
 
 ```
@@ -46,10 +47,16 @@ Example `_plugins.config` value:
   {
     "collection_name": "news",
     "fields": ["title", "body"],
+    "field_weights": {
+      "title": 10,
+      "body": 1
+    },
     "tokenizer": "porter"
   }
 ]
 ```
+
+When no `sort` query parameter is provided, the plugin orders results by SQLite FTS5 rank. If `field_weights` is configured, it uses a weighted `bm25(...)` rank so matches in more important fields rise to the top.
 
 ## Using the FTS Api Endpoint
 
