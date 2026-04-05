@@ -196,20 +196,20 @@ func TestParseFtsAuxOptionsRequiresEnabledFeatures(t *testing.T) {
 	}
 }
 
-func TestValidateSearchQueryRejectsPrefixQueriesWhenDisabled(t *testing.T) {
+func TestNormalizeSearchQueryDowngradesShortPrefixQueries(t *testing.T) {
 	p := &Plugin{}
 
-	if err := p.validateSearchQuery("moon*", FTSConfig{
-		CollectionName: "articles",
-	}); err == nil {
-		t.Fatalf("expected disabled prefix query error")
+	got := p.normalizeSearchQuery("mo* moon* OR stars*", FTSConfig{
+		MinPrefixQueryLength: 3,
+	})
+
+	if got != "mo moon* OR stars*" {
+		t.Fatalf("expected short prefix query to be downgraded, got %q", got)
 	}
 
-	if err := p.validateSearchQuery("moon*", FTSConfig{
-		CollectionName:     "articles",
-		AllowPrefixQueries: true,
-	}); err != nil {
-		t.Fatalf("unexpected error for enabled prefix queries: %v", err)
+	got = p.normalizeSearchQuery("moon*", FTSConfig{})
+	if got != "moon" {
+		t.Fatalf("expected prefix query to be downgraded by default, got %q", got)
 	}
 }
 
@@ -374,9 +374,9 @@ func TestFtsRouteIncludesAuxFieldsEvenWhenFieldsQueryOmitsThem(t *testing.T) {
 	scenario.Test(t)
 }
 
-func TestFtsRouteRejectsPrefixQueriesWhenDisabled(t *testing.T) {
+func TestFtsRouteDowngradesPrefixQueriesWhenBelowMinimum(t *testing.T) {
 	scenario := tests.ApiScenario{
-		Name:   "fts route rejects prefix queries unless enabled",
+		Name:   "fts route downgrades short prefix queries to non-prefix search",
 		Method: http.MethodGet,
 		URL:    "/api/collections/articles/records/fts?search=ghosts*",
 		TestAppFactory: func(t testing.TB) *tests.TestApp {
@@ -406,10 +406,17 @@ func TestFtsRouteRejectsPrefixQueriesWhenDisabled(t *testing.T) {
 			cfg := core.NewRecord(plugins)
 			cfg.Set(pluginNameField, p.Name())
 			cfg.Set(enabledField, true)
-			cfg.Set(configField, `[{"collection_name":"articles","fields":["title"]}]`)
+			cfg.Set(configField, `[{"collection_name":"articles","fields":["title"],"min_prefix_query_length":10}]`)
 
 			if err := app.Save(cfg); err != nil {
 				t.Fatalf("failed to save plugin config: %v", err)
+			}
+
+			record := core.NewRecord(articles)
+			record.Set("title", "Ghost stories")
+
+			if err := app.Save(record); err != nil {
+				t.Fatalf("failed to save article record: %v", err)
 			}
 
 			if err := p.refreshState(app); err != nil {
@@ -418,9 +425,9 @@ func TestFtsRouteRejectsPrefixQueriesWhenDisabled(t *testing.T) {
 
 			return app
 		},
-		ExpectedStatus: http.StatusBadRequest,
+		ExpectedStatus: http.StatusOK,
 		ExpectedContent: []string{
-			`"message":"Prefix queries are not enabled for collection \"articles\"."`,
+			`"title":"Ghost stories"`,
 		},
 	}
 

@@ -34,7 +34,7 @@ xpb build --with github.com/mjadobson/pb-plugin-fts@latest
    - `field_weights`: optional object mapping field names to ranking weights when using default FTS sort; omitted fields default to `1`
    - `allow_snippets`: optional boolean enabling `snippet=` query output; defaults to `false`
    - `allow_highlights`: optional boolean enabling `highlight=` query output; defaults to `false`
-   - `allow_prefix_queries`: optional boolean enabling prefix queries like `moon*`; defaults to `false`
+   - `min_prefix_query_length`: optional integer threshold for keeping prefix queries like `moon*`; shorter prefixes are automatically downgraded to normal term searches and the default `0` disables prefix behavior entirely
    - `prefixes`: optional array of FTS5 prefix index lengths such as `[2, 3]`; improves prefix-query performance at the cost of index size
    - `tokenizer`: optional [fts5 tokenizer](https://sqlite.org/fts5.html#tokenizers); defaults to `porter`
 4. The `id` field is always added automatically with a default weight of `1`, and only one FTS config per collection is supported.
@@ -57,7 +57,7 @@ Example `_plugins.config` value:
     },
     "allow_snippets": true,
     "allow_highlights": true,
-    "allow_prefix_queries": true,
+    "min_prefix_query_length": 3,
     "prefixes": [2, 3],
     "tokenizer": "porter"
   }
@@ -66,7 +66,7 @@ Example `_plugins.config` value:
 
 When no `sort` query parameter is provided, the plugin orders results by SQLite FTS5 rank. If `field_weights` is configured, it uses a weighted `bm25(...)` rank so matches in more important fields rise to the top.
 
-Prefix queries like `moon*` are disabled by default. To allow them efficiently, enable `allow_prefix_queries` and configure suitable `prefixes` values for the collection.
+Prefix queries like `moon*` are downgraded to normal term searches by default. To allow them efficiently, set `min_prefix_query_length` and configure suitable `prefixes` values for the collection. For example, with `min_prefix_query_length: 3`, `mo*` becomes `mo` while `moon*` remains a prefix query.
 
 You can also request SQLite FTS5 auxiliary output for matched rows:
 

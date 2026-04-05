@@ -40,14 +40,14 @@ type ftsAuxOptions struct {
 
 // FTSConfig represents a single FTS configuration for a collection
 type FTSConfig struct {
-	CollectionName      string             `json:"collection_name"`
-	Fields              []string           `json:"fields"`
-	FieldWeights        map[string]float64 `json:"field_weights,omitempty"`
-	Tokenizer           string             `json:"tokenizer"`
-	AllowSnippets       bool               `json:"allow_snippets"`
-	AllowHighlights     bool               `json:"allow_highlights"`
-	AllowPrefixQueries  bool               `json:"allow_prefix_queries"`
-	Prefixes            []int              `json:"prefixes,omitempty"`
+	CollectionName       string             `json:"collection_name"`
+	Fields               []string           `json:"fields"`
+	FieldWeights         map[string]float64 `json:"field_weights,omitempty"`
+	Tokenizer            string             `json:"tokenizer"`
+	AllowSnippets        bool               `json:"allow_snippets"`
+	AllowHighlights      bool               `json:"allow_highlights"`
+	MinPrefixQueryLength int                `json:"min_prefix_query_length"`
+	Prefixes             []int              `json:"prefixes,omitempty"`
 }
 
 func init() {
@@ -181,9 +181,7 @@ func (p *Plugin) setupFtsRoute(e *core.ServeEvent) error {
 		}
 
 		if search := e.Request.URL.Query().Get("search"); search != "" {
-			if err := p.validateSearchQuery(search, cfg); err != nil {
-				return e.BadRequestError(err.Error(), nil)
-			}
+			search = p.normalizeSearchQuery(search, cfg)
 
 			query.InnerJoin(ftsTableName, dbx.NewExp(fmt.Sprintf(
 				"%s = id",
@@ -224,7 +222,7 @@ func (p *Plugin) setupFtsRoute(e *core.ServeEvent) error {
 			return e.InternalServerError("Failed to enrich records", err)
 		}
 
-		if err := p.attachFtsAuxData(e.App, cfg, e.Request.URL.Query().Get("search"), records, auxOptions); err != nil {
+		if err := p.attachFtsAuxData(e.App, cfg, p.normalizeSearchQuery(e.Request.URL.Query().Get("search"), cfg), records, auxOptions); err != nil {
 			return e.InternalServerError("Failed to attach FTS auxiliary data", err)
 		}
 
@@ -489,12 +487,21 @@ func (p *Plugin) parseFtsAuxOptions(r *http.Request, cfg FTSConfig) (ftsAuxOptio
 	return opts, nil
 }
 
-func (p *Plugin) validateSearchQuery(search string, cfg FTSConfig) error {
-	if !cfg.AllowPrefixQueries && strings.Contains(search, "*") {
-		return fmt.Errorf("prefix queries are not enabled for collection %q", cfg.CollectionName)
+func (p *Plugin) normalizeSearchQuery(search string, cfg FTSConfig) string {
+	if search == "" || !strings.Contains(search, "*") {
+		return search
 	}
 
-	return nil
+	tokens := strings.Fields(search)
+	if len(tokens) == 0 {
+		return search
+	}
+
+	for i, token := range tokens {
+		tokens[i] = normalizePrefixToken(token, cfg.MinPrefixQueryLength)
+	}
+
+	return strings.Join(tokens, " ")
 }
 
 func (o ftsAuxOptions) Enabled() bool {
@@ -1005,4 +1012,21 @@ func parseCommaSeparatedList(raw string) []string {
 
 func sqliteStringLiteral(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
+func normalizePrefixToken(token string, minLength int) string {
+	if !strings.HasSuffix(token, "*") {
+		return token
+	}
+
+	trimmed := strings.TrimSuffix(token, "*")
+	if trimmed == "" {
+		return trimmed
+	}
+
+	if minLength <= 0 || len(trimmed) < minLength {
+		return trimmed
+	}
+
+	return token
 }
