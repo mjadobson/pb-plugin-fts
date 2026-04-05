@@ -32,6 +32,10 @@ xpb build --with github.com/mjadobson/pb-plugin-fts@latest
    - `collection_name`: the collection to index
    - `fields`: optional array of field names to index; if omitted or empty, all public fields are indexed
    - `field_weights`: optional object mapping field names to ranking weights when using default FTS sort; omitted fields default to `1`
+   - `allow_snippets`: optional boolean enabling `snippet=` query output; defaults to `false`
+   - `allow_highlights`: optional boolean enabling `highlight=` query output; defaults to `false`
+   - `allow_prefix_queries`: optional boolean enabling prefix queries like `moon*`; defaults to `false`
+   - `prefixes`: optional array of FTS5 prefix index lengths such as `[2, 3]`; improves prefix-query performance at the cost of index size
    - `tokenizer`: optional [fts5 tokenizer](https://sqlite.org/fts5.html#tokenizers); defaults to `porter`
 4. The `id` field is always added automatically with a default weight of `1`, and only one FTS config per collection is supported.
 5. Use the FTS API endpoint to access full text search capabilities:
@@ -51,12 +55,18 @@ Example `_plugins.config` value:
       "title": 10,
       "body": 1
     },
+    "allow_snippets": true,
+    "allow_highlights": true,
+    "allow_prefix_queries": true,
+    "prefixes": [2, 3],
     "tokenizer": "porter"
   }
 ]
 ```
 
 When no `sort` query parameter is provided, the plugin orders results by SQLite FTS5 rank. If `field_weights` is configured, it uses a weighted `bm25(...)` rank so matches in more important fields rise to the top.
+
+Prefix queries like `moon*` are disabled by default. To allow them efficiently, enable `allow_prefix_queries` and configure suitable `prefixes` values for the collection.
 
 You can also request SQLite FTS5 auxiliary output for matched rows:
 
@@ -68,6 +78,7 @@ You can also request SQLite FTS5 auxiliary output for matched rows:
 - `snippetTokens` controls snippet length and must be between `1` and `64` (default `16`)
 
 These auxiliary values are only computed for the paged result set returned by the current search, not for the full collection.
+They are disabled by default and must be explicitly enabled per collection with `allow_snippets` and `allow_highlights`.
 
 ## Using the FTS Api Endpoint
 

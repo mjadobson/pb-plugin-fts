@@ -40,10 +40,14 @@ type ftsAuxOptions struct {
 
 // FTSConfig represents a single FTS configuration for a collection
 type FTSConfig struct {
-	CollectionName string   `json:"collection_name"`
-	Fields         []string `json:"fields"`
-	FieldWeights   map[string]float64 `json:"field_weights,omitempty"`
-	Tokenizer      string   `json:"tokenizer"`
+	CollectionName      string             `json:"collection_name"`
+	Fields              []string           `json:"fields"`
+	FieldWeights        map[string]float64 `json:"field_weights,omitempty"`
+	Tokenizer           string             `json:"tokenizer"`
+	AllowSnippets       bool               `json:"allow_snippets"`
+	AllowHighlights     bool               `json:"allow_highlights"`
+	AllowPrefixQueries  bool               `json:"allow_prefix_queries"`
+	Prefixes            []int              `json:"prefixes,omitempty"`
 }
 
 func init() {
@@ -177,6 +181,10 @@ func (p *Plugin) setupFtsRoute(e *core.ServeEvent) error {
 		}
 
 		if search := e.Request.URL.Query().Get("search"); search != "" {
+			if err := p.validateSearchQuery(search, cfg); err != nil {
+				return e.BadRequestError(err.Error(), nil)
+			}
+
 			query.InnerJoin(ftsTableName, dbx.NewExp(fmt.Sprintf(
 				"%s = id",
 				p.ftsFieldName("id"),
@@ -219,6 +227,8 @@ func (p *Plugin) setupFtsRoute(e *core.ServeEvent) error {
 		if err := p.attachFtsAuxData(e.App, cfg, e.Request.URL.Query().Get("search"), records, auxOptions); err != nil {
 			return e.InternalServerError("Failed to attach FTS auxiliary data", err)
 		}
+
+		p.ensureAuxFieldsInResponse(e.Request, auxOptions)
 
 		return e.JSON(http.StatusOK, result)
 	})
@@ -326,6 +336,20 @@ func (p *Plugin) normalizeConfig(cfg FTSConfig, collection *core.Collection) FTS
 		}
 	}
 
+	if len(cfg.Prefixes) > 0 {
+		slices.Sort(cfg.Prefixes)
+
+		normalizedPrefixes := make([]int, 0, len(cfg.Prefixes))
+		var last int
+		for i, prefix := range cfg.Prefixes {
+			if i == 0 || prefix != last {
+				normalizedPrefixes = append(normalizedPrefixes, prefix)
+			}
+			last = prefix
+		}
+		cfg.Prefixes = normalizedPrefixes
+	}
+
 	return cfg
 }
 
@@ -345,6 +369,12 @@ func (p *Plugin) validateConfigForCollection(cfg FTSConfig, collection *core.Col
 
 		if weight < 0 {
 			return fmt.Errorf("field weight for %q must be greater than or equal to 0", fieldName)
+		}
+	}
+
+	for _, prefix := range cfg.Prefixes {
+		if prefix <= 0 {
+			return fmt.Errorf("prefix values must be greater than 0")
 		}
 	}
 
@@ -431,6 +461,14 @@ func (p *Plugin) parseFtsAuxOptions(r *http.Request, cfg FTSConfig) (ftsAuxOptio
 		return opts, fmt.Errorf("search is required when using snippet or highlight")
 	}
 
+	if len(opts.HighlightFields) > 0 && !cfg.AllowHighlights {
+		return opts, fmt.Errorf("highlight output is not enabled for collection %q", cfg.CollectionName)
+	}
+
+	if len(opts.SnippetFields) > 0 && !cfg.AllowSnippets {
+		return opts, fmt.Errorf("snippet output is not enabled for collection %q", cfg.CollectionName)
+	}
+
 	indexedFields := make(map[string]struct{}, len(cfg.Fields))
 	for _, field := range cfg.Fields {
 		indexedFields[field] = struct{}{}
@@ -451,8 +489,59 @@ func (p *Plugin) parseFtsAuxOptions(r *http.Request, cfg FTSConfig) (ftsAuxOptio
 	return opts, nil
 }
 
+func (p *Plugin) validateSearchQuery(search string, cfg FTSConfig) error {
+	if !cfg.AllowPrefixQueries && strings.Contains(search, "*") {
+		return fmt.Errorf("prefix queries are not enabled for collection %q", cfg.CollectionName)
+	}
+
+	return nil
+}
+
 func (o ftsAuxOptions) Enabled() bool {
 	return len(o.HighlightFields) > 0 || len(o.SnippetFields) > 0
+}
+
+func (o ftsAuxOptions) ResponseFieldNames(p *Plugin) []string {
+	result := make([]string, 0, len(o.HighlightFields)+len(o.SnippetFields))
+
+	for _, field := range o.HighlightFields {
+		result = append(result, p.ftsHighlightFieldName(field))
+	}
+
+	for _, field := range o.SnippetFields {
+		result = append(result, p.ftsSnippetFieldName(field))
+	}
+
+	return result
+}
+
+func (p *Plugin) ensureAuxFieldsInResponse(r *http.Request, opts ftsAuxOptions) {
+	if !opts.Enabled() {
+		return
+	}
+
+	query := r.URL.Query()
+	rawFields := query.Get("fields")
+	if rawFields == "" {
+		return
+	}
+
+	fields := parseCommaSeparatedList(rawFields)
+	seen := make(map[string]struct{}, len(fields))
+	for _, field := range fields {
+		seen[field] = struct{}{}
+	}
+
+	for _, field := range opts.ResponseFieldNames(p) {
+		if _, ok := seen[field]; ok {
+			continue
+		}
+
+		fields = append(fields, field)
+	}
+
+	query.Set("fields", strings.Join(fields, ","))
+	r.URL.RawQuery = query.Encode()
 }
 
 func (p *Plugin) attachFtsAuxData(app core.App, cfg FTSConfig, search string, records []*core.Record, opts ftsAuxOptions) error {
@@ -583,10 +672,9 @@ func (p *Plugin) createFtsTable(app core.App, config FTSConfig) error {
 	}
 
 	query = app.DB().NewQuery(fmt.Sprintf(
-		`CREATE VIRTUAL TABLE %s USING fts5 (%s, tokenize="%s");`,
+		`CREATE VIRTUAL TABLE %s USING fts5 (%s);`,
 		ftsTableName,
-		strings.Join(ftsFieldNames, ", "),
-		config.Tokenizer,
+		strings.Join(p.ftsTableOptions(config, ftsFieldNames), ", "),
 	))
 	if _, err := query.Execute(); err != nil {
 		if strings.Contains(err.Error(), "no such tokenizer") {
@@ -744,6 +832,23 @@ func (p *Plugin) ftsFieldNameSlice(fieldNames []string) []string {
 		result = append(result, p.ftsFieldName(fieldName))
 	}
 	return result
+}
+
+func (p *Plugin) ftsTableOptions(cfg FTSConfig, ftsFieldNames []string) []string {
+	options := make([]string, 0, len(ftsFieldNames)+2)
+	options = append(options, ftsFieldNames...)
+	options = append(options, fmt.Sprintf(`tokenize="%s"`, cfg.Tokenizer))
+
+	if len(cfg.Prefixes) > 0 {
+		prefixes := make([]string, 0, len(cfg.Prefixes))
+		for _, prefix := range cfg.Prefixes {
+			prefixes = append(prefixes, strconv.Itoa(prefix))
+		}
+
+		options = append(options, fmt.Sprintf(`prefix='%s'`, strings.Join(prefixes, " ")))
+	}
+
+	return options
 }
 
 func (p *Plugin) validatePluginsConfigField(e *core.RecordEvent) error {
