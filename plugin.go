@@ -25,6 +25,18 @@ const pluginNameField = "plugin_name"
 const configField = "config"
 const enabledField = "enabled"
 const defaultTokenizer = "porter"
+const defaultFtsSnippetTokens = 16
+
+type ftsAuxOptions struct {
+	HighlightFields []string
+	HighlightBefore string
+	HighlightAfter  string
+	SnippetFields   []string
+	SnippetBefore   string
+	SnippetAfter    string
+	SnippetEllipsis string
+	SnippetTokens   int
+}
 
 // FTSConfig represents a single FTS configuration for a collection
 type FTSConfig struct {
@@ -157,10 +169,14 @@ func (p *Plugin) setupFtsRoute(e *core.ServeEvent) error {
 		query := e.App.RecordQuery(collection)
 
 		ftsTableName := p.ftsTableNameFromCollectionName(collection.Name)
+		cfg := configs[0]
+
+		auxOptions, err := p.parseFtsAuxOptions(e.Request, cfg)
+		if err != nil {
+			return e.BadRequestError(err.Error(), nil)
+		}
 
 		if search := e.Request.URL.Query().Get("search"); search != "" {
-			cfg := configs[0]
-
 			query.InnerJoin(ftsTableName, dbx.NewExp(fmt.Sprintf(
 				"%s = id",
 				p.ftsFieldName("id"),
@@ -198,6 +214,10 @@ func (p *Plugin) setupFtsRoute(e *core.ServeEvent) error {
 
 		if err := apis.EnrichRecords(e, records); err != nil {
 			return e.InternalServerError("Failed to enrich records", err)
+		}
+
+		if err := p.attachFtsAuxData(e.App, cfg, e.Request.URL.Query().Get("search"), records, auxOptions); err != nil {
+			return e.InternalServerError("Failed to attach FTS auxiliary data", err)
 		}
 
 		return e.JSON(http.StatusOK, result)
@@ -358,6 +378,178 @@ func (p *Plugin) ftsRankExpression(cfg FTSConfig) string {
 	}
 
 	return fmt.Sprintf("bm25(%s)", strings.Join(weights, ", "))
+}
+
+func (p *Plugin) parseFtsAuxOptions(r *http.Request, cfg FTSConfig) (ftsAuxOptions, error) {
+	query := r.URL.Query()
+
+	opts := ftsAuxOptions{
+		HighlightFields: parseCommaSeparatedList(query.Get("highlight")),
+		HighlightBefore: query.Get("highlightBefore"),
+		HighlightAfter:  query.Get("highlightAfter"),
+		SnippetFields:   parseCommaSeparatedList(query.Get("snippet")),
+		SnippetBefore:   query.Get("snippetBefore"),
+		SnippetAfter:    query.Get("snippetAfter"),
+		SnippetEllipsis: query.Get("snippetEllipsis"),
+		SnippetTokens:   defaultFtsSnippetTokens,
+	}
+
+	if raw := query.Get("snippetTokens"); raw != "" {
+		tokens, err := strconv.Atoi(raw)
+		if err != nil {
+			return opts, fmt.Errorf("snippetTokens must be an integer")
+		}
+
+		if tokens <= 0 || tokens > 64 {
+			return opts, fmt.Errorf("snippetTokens must be between 1 and 64")
+		}
+
+		opts.SnippetTokens = tokens
+	}
+
+	if opts.HighlightBefore == "" {
+		opts.HighlightBefore = "<b>"
+	}
+	if opts.HighlightAfter == "" {
+		opts.HighlightAfter = "</b>"
+	}
+	if opts.SnippetBefore == "" {
+		opts.SnippetBefore = "<b>"
+	}
+	if opts.SnippetAfter == "" {
+		opts.SnippetAfter = "</b>"
+	}
+	if opts.SnippetEllipsis == "" {
+		opts.SnippetEllipsis = "..."
+	}
+
+	if !opts.Enabled() {
+		return opts, nil
+	}
+
+	if query.Get("search") == "" {
+		return opts, fmt.Errorf("search is required when using snippet or highlight")
+	}
+
+	indexedFields := make(map[string]struct{}, len(cfg.Fields))
+	for _, field := range cfg.Fields {
+		indexedFields[field] = struct{}{}
+	}
+
+	for _, field := range opts.HighlightFields {
+		if _, ok := indexedFields[field]; !ok {
+			return opts, fmt.Errorf("highlight field %q is not indexed for collection %q", field, cfg.CollectionName)
+		}
+	}
+
+	for _, field := range opts.SnippetFields {
+		if _, ok := indexedFields[field]; !ok {
+			return opts, fmt.Errorf("snippet field %q is not indexed for collection %q", field, cfg.CollectionName)
+		}
+	}
+
+	return opts, nil
+}
+
+func (o ftsAuxOptions) Enabled() bool {
+	return len(o.HighlightFields) > 0 || len(o.SnippetFields) > 0
+}
+
+func (p *Plugin) attachFtsAuxData(app core.App, cfg FTSConfig, search string, records []*core.Record, opts ftsAuxOptions) error {
+	if !opts.Enabled() || search == "" || len(records) == 0 {
+		return nil
+	}
+
+	recordByID := make(map[string]*core.Record, len(records))
+	recordIDs := make([]any, 0, len(records))
+	for _, record := range records {
+		recordByID[record.Id] = record
+		recordIDs = append(recordIDs, record.Id)
+	}
+
+	rows, err := p.fetchFtsAuxRows(app, cfg, search, recordIDs, opts)
+	if err != nil {
+		return err
+	}
+
+	for _, row := range rows {
+		idValue, ok := row[p.ftsFieldName("id")]
+		if !ok || !idValue.Valid {
+			continue
+		}
+
+		record := recordByID[idValue.String]
+		if record == nil {
+			continue
+		}
+
+		record.WithCustomData(true)
+
+		for key, value := range row {
+			if key == p.ftsFieldName("id") {
+				continue
+			}
+
+			if value.Valid {
+				record.SetRaw(key, value.String)
+			} else {
+				record.SetRaw(key, nil)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (p *Plugin) fetchFtsAuxRows(app core.App, cfg FTSConfig, search string, recordIDs []any, opts ftsAuxOptions) ([]dbx.NullStringMap, error) {
+	ftsTableName := p.ftsTableNameFromCollectionName(cfg.CollectionName)
+	columnIndexes := make(map[string]int, len(cfg.Fields))
+	for idx, field := range cfg.Fields {
+		columnIndexes[field] = idx
+	}
+
+	columns := []string{
+		fmt.Sprintf("%s AS [[%s]]", p.ftsFieldName("id"), p.ftsFieldName("id")),
+	}
+
+	for _, field := range opts.HighlightFields {
+		columns = append(columns, fmt.Sprintf(
+			"highlight(%s, %d, %s, %s) AS [[%s]]",
+			ftsTableName,
+			columnIndexes[field],
+			sqliteStringLiteral(opts.HighlightBefore),
+			sqliteStringLiteral(opts.HighlightAfter),
+			p.ftsHighlightFieldName(field),
+		))
+	}
+
+	for _, field := range opts.SnippetFields {
+		columns = append(columns, fmt.Sprintf(
+			"snippet(%s, %d, %s, %s, %s, %d) AS [[%s]]",
+			ftsTableName,
+			columnIndexes[field],
+			sqliteStringLiteral(opts.SnippetBefore),
+			sqliteStringLiteral(opts.SnippetAfter),
+			sqliteStringLiteral(opts.SnippetEllipsis),
+			opts.SnippetTokens,
+			p.ftsSnippetFieldName(field),
+		))
+	}
+
+	rows := []dbx.NullStringMap{}
+	err := app.DB().
+		Select(columns...).
+		From(ftsTableName).
+		AndWhere(dbx.NewExp(fmt.Sprintf("%s MATCH {:search}", ftsTableName), dbx.Params{
+			"search": search,
+		})).
+		AndWhere(dbx.In(p.ftsFieldName("id"), recordIDs...)).
+		All(&rows)
+	if err != nil {
+		return nil, err
+	}
+
+	return rows, nil
 }
 
 func (p *Plugin) getConfigsForCollection(collectionName string) []FTSConfig {
@@ -538,6 +730,14 @@ func (p *Plugin) ftsFieldName(fieldName string) string {
 	return fmt.Sprintf("_fts_%s", fieldName)
 }
 
+func (p *Plugin) ftsHighlightFieldName(fieldName string) string {
+	return fmt.Sprintf("_fts_highlight_%s", fieldName)
+}
+
+func (p *Plugin) ftsSnippetFieldName(fieldName string) string {
+	return fmt.Sprintf("_fts_snippet_%s", fieldName)
+}
+
 func (p *Plugin) ftsFieldNameSlice(fieldNames []string) []string {
 	result := make([]string, 0, len(fieldNames))
 	for _, fieldName := range fieldNames {
@@ -670,4 +870,34 @@ func parsePluginConfigs(row *core.Record) ([]FTSConfig, error) {
 	}
 
 	return configs, nil
+}
+
+func parseCommaSeparatedList(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+
+	for _, part := range parts {
+		value := strings.TrimSpace(part)
+		if value == "" {
+			continue
+		}
+
+		if _, ok := seen[value]; ok {
+			continue
+		}
+
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+
+	return result
+}
+
+func sqliteStringLiteral(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }

@@ -58,6 +58,17 @@ Example `_plugins.config` value:
 
 When no `sort` query parameter is provided, the plugin orders results by SQLite FTS5 rank. If `field_weights` is configured, it uses a weighted `bm25(...)` rank so matches in more important fields rise to the top.
 
+You can also request SQLite FTS5 auxiliary output for matched rows:
+
+- `highlight=field1,field2` adds `_fts_highlight_<field>` values to each returned record
+- `snippet=field1,field2` adds `_fts_snippet_<field>` values to each returned record
+- `highlightBefore` / `highlightAfter` customize `highlight()` markup and default to `<b>` / `</b>`
+- `snippetBefore` / `snippetAfter` customize `snippet()` markup and default to `<b>` / `</b>`
+- `snippetEllipsis` customizes the snippet truncation marker and defaults to `...`
+- `snippetTokens` controls snippet length and must be between `1` and `64` (default `16`)
+
+These auxiliary values are only computed for the paged result set returned by the current search, not for the full collection.
+
 ## Using the FTS Api Endpoint
 
 ### JavaScript SDK
@@ -76,6 +87,8 @@ const result = await pb.send(`/api/collections/${collectionName}/records/fts`, {
     // Use MATCH value
     // https://sqlite.org/fts5.html
     search: "ghosts OR aliens",
+    highlight: "title",
+    snippet: "body",
   },
 });
 ```
@@ -100,5 +113,7 @@ const result = await pb.send(`/api/collections/${collectionName}/records/fts`, {
     // Use MATCH value
     // https://sqlite.org/fts5.html
     search: 'ghosts OR aliens', // leave blank if fts is not enabled on collection
+    highlight: 'title',
+    snippet: 'body',
   );
 ```
